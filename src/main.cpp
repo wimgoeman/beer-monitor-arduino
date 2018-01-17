@@ -2,65 +2,57 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiMulti.h>
 #include <ESP8266HTTPClient.h>
-#include <SHA256.h>
+#include "util/Logger.hpp"
+#include "util/Led.hpp"
+#include "http/HttpWrapper.hpp"
 #include "constants.hpp"
+#include "calcToken.hpp"
 
+struct Leds {
+    Led red = Led(0);
+    Led blue = Led(2);
+};
+
+Leds leds;
 ESP8266WiFiMulti WiFiMulti;
 
-#define LED_RED 0
-#define LED_BLUE 2
-
-String calcToken(String timestamp);
-
 void setup() {
-    Serial.begin(115200);
-
-    //Register LEDs
-    pinMode(LED_BLUE, OUTPUT);
-    pinMode(LED_RED, OUTPUT);
-
+    INIT_LOGGING(115200);
     //Initiate WiFi connectivity
-    Serial.println("Init started");
-    digitalWrite(LED_BLUE, LOW); //Blue led shows wifi not connected
+    LOG("Init started");
+    leds.red.setLit(false); //Red LED indicates error state
+    leds.blue.setLit(true); //Blue LED shows wifi not connected
     WiFi.mode(WIFI_STA);
     WiFiMulti.addAP(BM_WIFI_SSID, BM_WIFI_PASSPHRASE);
-    delay(100);
-    digitalWrite(LED_RED, HIGH);
-    Serial.println("Init completed");
+    delay(1000);
+    LOG("Init completed");
 }
 
-void loop() {
-    Serial.println("Loop!");
+bool checkWifi() {
     if (WiFiMulti.run() != WL_CONNECTED) {
-        Serial.println("Wifi not connected!!");
-        digitalWrite(LED_BLUE, LOW);
+        LOG("Wifi not connected!!");
+        leds.blue.setLit(true);
         delay(1000);
-        return;
+        return false;
     }
-    Serial.println("WiFi is connected");
-    digitalWrite(LED_BLUE, HIGH);
+    LOG("WiFi is connected");
+    leds.blue.setLit(false);
+    return true;
+}
 
-    HTTPClient http;
-    Serial.println("Get server timestamp");
-    http.begin("http://192.168.0.248:8090/api/time");
-    int httpCode = http.GET();
-    String timestamp;
-    if (httpCode == 200) {
-        Serial.printf("HTTP request succesfull: %d\n", httpCode);
-        timestamp = http.getString();
-    } else {
-        digitalWrite(LED_RED, LOW); //Indicate error
-        if (httpCode < 0)
-            Serial.println("HTTP request failed: " + http.errorToString(httpCode));
-        else
-            Serial.printf("HTTP request failed (%d): %s\n", httpCode, http.getString().c_str());
-        delay(10000);
-        return;
+bool fetchTimestamp(HttpWrapper& http, String& timestamp) {
+    HttpResponse res = http.get("http://192.168.0.248:8090/api/time");
+    if (res.hasError() || res.getStatusCode() != 200) {
+        if (!res.hasError()) {
+            LOGF(256, "Error while getting time: [%d] %s", res.getStatusCode(), res.getPayload().c_str());
+        }
+        return false;
     }
+    timestamp = res.getPayload();
+    return true;
+}
 
-    Serial.println("Attempting HTTP request");
-    http.begin("http://192.168.0.248:8090/api/readings");
-    http.addHeader("Content-Type", "application/json");
+bool uploadReadings(HttpWrapper& http, const String& timestamp) {
     char jsonPayloadFmt[512];
     snprintf(jsonPayloadFmt, 512, "{\"temperature\": %2.1f, \"humidity\": %d, \"token\": \"%s\"}",
         (float)random(160,240) / 10,
@@ -68,40 +60,44 @@ void loop() {
         calcToken(timestamp).c_str()
         );
     String jsonPayload(jsonPayloadFmt);
-    // String jsonPayload = "{\"temperature\": 20.5, \"humidity\": 43, \"token\": \""
-    //     +  + "\"}";
-    Serial.println("Payload: " + jsonPayload);
+    LOG("JSON payload: " + jsonPayload);
+    HttpResponse res = http.post("http://192.168.0.248:8090/api/readings", jsonPayload);
+    if (res.hasError() || res.getStatusCode() != 200) {
+        if (!res.hasError()) {
+            LOGF(256, "Error while uploading readings: [%d] %s", res.getStatusCode(), res.getPayload().c_str());
+        }
+        return false;
+    }
+    LOG("Readings uploaded!");
+    return true;
+}
 
-    httpCode = http.POST(jsonPayload);
-    if (httpCode == 200) {
-        Serial.printf("HTTP request succesfull: %d\n", httpCode);
-        Serial.println("Response payload: " + http.getString());
-    } else {
-        digitalWrite(LED_RED, LOW); //Indicate error
-        if (httpCode < 0)
-            Serial.println("HTTP request failed: " + http.errorToString(httpCode));
-        else
-            Serial.printf("HTTP request failed (%d): %s\n", httpCode, http.getString().c_str());
-        delay(10000);
+void handleError() {
+    //Light red LED for error
+    leds.red.setLit(true);
+
+    //Wait 10s before retrying
+    delay(10000);
+}
+
+void loop() {
+    LOG("Loop!");
+    if (!checkWifi()) return;
+
+    HttpWrapper http;
+    String timestamp;
+    if (!fetchTimestamp(http, timestamp)) {
+        handleError();
+        return;
+    }
+    if (!uploadReadings(http, timestamp)) {
+        handleError();
         return;
     }
 
-    digitalWrite(LED_RED, HIGH); //Indicate no error
-    delay(60000); // Only update once per minute
-}
-
-String calcToken(String timestamp) {
-    Serial.println("Using timestamp " + timestamp);
-    SHA256 sha256;
-    sha256.resetHMAC(BM_SECRET, BM_SECRET_LENGTH);
-    sha256.update(timestamp.c_str(), timestamp.length());
-    char buffer[32];
-    sha256.finalizeHMAC(BM_SECRET, BM_SECRET_LENGTH, buffer, 32);
-    char result[65];
-    result[64] = 0;
-    for (int i = 0; i <  32; i++) {
-        sprintf(&result[2*i], "%02x", buffer[i]);
-    }
-
-    return String(result);
+    //Dim error LED if it was still on
+    leds.red.setLit(false);
+    
+    // Only update once per minute
+    delay(60000);
 }
